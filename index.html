@@ -108,6 +108,7 @@
                 <p>
                     🧱 壁がどんどん迫ってくる！<br />
                     🕺 壁の穴と<b>同じポーズ</b>をして通り抜けよう。<br />
+                    🚀 クリアするたびに壁が<b>速く</b>なる！<br />
                     💔
                     ポーズが合っていないとハートが減る。なくなったらゲームオーバー。<br />
                     👫
@@ -166,6 +167,9 @@
             const GOOD = 0.58,
                 PERFECT = 0.82; // 一致度のしきい値
             const Z_FAR = 7; // 壁の出現距離（1 = プレイヤーの位置）
+            const BASE_DUR = 6, // 速度 ×1 のとき壁が届くまでの秒数
+                SPEED_STEP = 0.1, // クリア1回で上がる速度
+                MAX_SPEED = 3; // 速度の上限（壁が届くまで2秒）
             const MODES = {
                 solo: { label: "1人プレイ", players: 1, hearts: 3 },
                 coop: { label: "2人で協力", players: 2, hearts: 5 }, // ハートは2人で共有
@@ -403,7 +407,7 @@
                 raise: 0,
             }));
             let banks = []; // ハート・スコア・コンボ（協力/1人は共有で1つ、対戦は1人1つ）
-            let wallsPassed, gameClock, wall, nextWallAt;
+            let wallsPassed, speedLevel, gameClock, wall, nextWallAt;
             let overAt = 0;
             let shake = 0,
                 flash = 0,
@@ -418,6 +422,7 @@
             const numPlayers = () => MODES[mode].players;
             const active = () => players.slice(0, numPlayers());
             const bankOf = (i) => (mode === "versus" ? banks[i] : banks[0]);
+            const speed = () => Math.min(MAX_SPEED, 1 + speedLevel * SPEED_STEP);
 
             function loadBest() {
                 try {
@@ -765,6 +770,7 @@
                 });
                 banks = mode === "versus" ? [mk(), mk()] : [mk()];
                 wallsPassed = 0;
+                speedLevel = 0;
                 gameClock = 0;
                 wall = null;
                 nextWallAt = 1.2;
@@ -805,7 +811,7 @@
             }
 
             function spawnWall() {
-                const dur = Math.max(2.4, 6 - wallsPassed * 0.22);
+                const dur = BASE_DUR / speed();
                 const first = pickPose();
                 // 協力は2人別々のポーズ、対戦は公平に同じポーズ
                 const poses =
@@ -875,14 +881,27 @@
                     }
                 });
                 // コンボは「そのハートを使う全員」が通れたときだけ続く
+                let anyCleared = false;
                 banks.forEach((b, bi) => {
                     const mine = wall.results.filter((_, i) => bankOf(i) === b);
                     if (mine.every((r) => r !== "miss")) {
                         b.combo++;
                         b.cleared++;
                         b.bestCombo = Math.max(b.bestCombo, b.combo);
+                        anyCleared = true;
                     } else b.combo = 0;
                 });
+                // クリアするたびに壁が速くなる（対戦はどちらかが通過すれば上がる）
+                if (anyCleared && speed() < MAX_SPEED) {
+                    speedLevel++;
+                    popup(
+                        "SPEED UP!",
+                        "#ff9a3c",
+                        `速度 ×${speed().toFixed(1)}`,
+                        W / 2,
+                        0.7,
+                    );
+                }
                 if (
                     mode === "coop" &&
                     wall.results.every((r) => r === "perfect")
@@ -910,7 +929,7 @@
                 }
                 wallsPassed++;
                 nextWallAt =
-                    gameClock + 0.5 + Math.max(0.5, 1.1 - wallsPassed * 0.03);
+                    gameClock + 0.5 + Math.max(0.5, 1.1 - speedLevel * 0.03);
             }
 
             function isOver() {
@@ -1418,7 +1437,7 @@
                         );
                 }
                 text(
-                    `WALL ${wallsPassed + 1}`,
+                    `WALL ${wallsPassed + 1}  ／  SPEED ×${speed().toFixed(1)}`,
                     W / 2,
                     16 + u * 3,
                     u * 3,
@@ -1689,6 +1708,7 @@
                         "#fff",
                     ],
                     ["しゃがみ・片足立ちのポーズは 0.5秒キープ！", "#ffcc33"],
+                    ["クリアするたびに壁が速くなる（最大3倍）", "#ff9a3c"],
                     [
                         "ポーズが合っていないとハートが減る。なくなったら終わり",
                         "#fff",
@@ -1997,6 +2017,8 @@
                         state,
                         mode,
                         wallsPassed,
+                        speed: speed(),
+                        dur: wall?.dur,
                         banks,
                         live: players.map((p) => p.live),
                         poses: wall?.poses,
