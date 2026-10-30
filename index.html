@@ -1,0 +1,2022 @@
+<!doctype html>
+<html lang="ja">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>ポーズウォール</title>
+        <style>
+            :root {
+                --bg: #0b0d17;
+                --fg: #fff;
+                --accent: #ffcc33;
+                --good: #3ddc84;
+                --bad: #ff4d6d;
+            }
+            html,
+            body {
+                margin: 0;
+                height: 100%;
+                background: var(--bg);
+                color: var(--fg);
+                font-family:
+                    "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo",
+                    system-ui, sans-serif;
+                overflow: hidden;
+            }
+            video {
+                display: none;
+            }
+            #game {
+                position: fixed;
+                inset: 0;
+                width: 100%;
+                height: 100%;
+                display: block;
+            }
+            .overlay {
+                position: fixed;
+                inset: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 18px;
+                text-align: center;
+                padding: 16px;
+                box-sizing: border-box;
+                background: rgba(5, 6, 15, 0.82);
+            }
+            .hidden {
+                display: none !important;
+            }
+            h1 {
+                margin: 0;
+                font-size: clamp(44px, 9vw, 104px);
+                letter-spacing: 0.06em;
+                color: var(--accent);
+                text-shadow:
+                    0 6px 0 #a35f00,
+                    0 12px 30px rgba(0, 0, 0, 0.6);
+            }
+            p {
+                margin: 0;
+                font-size: clamp(15px, 2.2vw, 20px);
+                line-height: 1.7;
+                opacity: 0.92;
+            }
+            .rules {
+                max-width: 640px;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 14px;
+                padding: 14px 22px;
+                text-align: left;
+            }
+            button {
+                font: inherit;
+                font-size: clamp(18px, 2.6vw, 24px);
+                font-weight: 700;
+                padding: 14px 36px;
+                border: 0;
+                border-radius: 999px;
+                background: var(--accent);
+                color: #2a1700;
+                cursor: pointer;
+                box-shadow: 0 6px 0 #a35f00;
+            }
+            button:active {
+                transform: translateY(3px);
+                box-shadow: 0 3px 0 #a35f00;
+            }
+            button:disabled {
+                opacity: 0.5;
+                cursor: wait;
+            }
+            #status {
+                min-height: 1.5em;
+                color: var(--accent);
+            }
+        </style>
+    </head>
+    <body>
+        <video id="video" playsinline muted></video>
+        <canvas id="game"></canvas>
+
+        <div id="title" class="overlay">
+            <h1>ポーズウォール</h1>
+            <div class="rules">
+                <p>
+                    🧱 壁がどんどん迫ってくる！<br />
+                    🕺 壁の穴と<b>同じポーズ</b>をして通り抜けよう。<br />
+                    💔
+                    ポーズが合っていないとハートが減る。なくなったらゲームオーバー。<br />
+                    👫
+                    <b>2人プレイ</b
+                    >もできるよ：左に立つ人がP1、右に立つ人がP2。<br />
+                    　・協力 … 2人それぞれ別の穴。ハート5つを2人で共有<br />
+                    　・対戦 … 同じ穴で勝負。先にハートがなくなった方の負け<br />
+                    📷
+                    カメラから2〜3m（2人なら3m以上）離れて、<b>頭から足まで全身</b>が映るように立ってね。<br />
+                    ✋
+                    カメラが起動したら、メニューは<b>ボタンに手をかざして</b>選べるよ。
+                </p>
+            </div>
+            <button id="startBtn">カメラを起動</button>
+            <p id="status"></p>
+        </div>
+
+        <script type="module">
+            // 同梱のライブラリとモデルを使う（Web版は vendor/、アプリ版は node_modules/）。見つからなければ CDN から読む
+            const LOCALS = [
+                "./vendor/tasks-vision/",
+                "./node_modules/@mediapipe/tasks-vision/",
+            ];
+            const CDN =
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/";
+            let lib, base;
+            for (const dir of LOCALS) {
+                try {
+                    lib = await import(dir + "vision_bundle.mjs");
+                    base = dir;
+                    break;
+                } catch {}
+            }
+            if (!lib) {
+                lib = await import(CDN + "vision_bundle.mjs");
+                base = CDN;
+            }
+            const { PoseLandmarker, FilesetResolver } = lib;
+
+            const WASM_URL = base + "wasm";
+            const MODEL_URL =
+                base !== CDN
+                    ? "./models/pose_landmarker_lite.task"
+                    : "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+            const $ = (id) => document.getElementById(id);
+            const video = $("video"),
+                cv = $("game"),
+                ctx = cv.getContext("2d");
+            const wallCv = document.createElement("canvas"),
+                wctx = wallCv.getContext("2d");
+            const texCv = document.createElement("canvas"),
+                tctx = texCv.getContext("2d");
+
+            // ---------- 定数 ----------
+            const GOOD = 0.58,
+                PERFECT = 0.82; // 一致度のしきい値
+            const Z_FAR = 7; // 壁の出現距離（1 = プレイヤーの位置）
+            const MODES = {
+                solo: { label: "1人プレイ", players: 1, hearts: 3 },
+                coop: { label: "2人で協力", players: 2, hearts: 5 }, // ハートは2人で共有
+                versus: { label: "2人で対戦", players: 2, hearts: 3 }, // ハートは1人ずつ
+            };
+            const PLAYER_COLORS = ["#7fdcff", "#ff8ad8"];
+
+            // 判定に使う体のパーツ（左右は画面上の左右。鏡映しなので自分の左手＝画面の左）
+            const SEGS = [
+                { a: 11, b: 13, leg: false }, // 左上腕
+                { a: 13, b: 15, leg: false }, // 左前腕
+                { a: 12, b: 14, leg: false }, // 右上腕
+                { a: 14, b: 16, leg: false }, // 右前腕
+                { a: 23, b: 25, leg: true }, // 左太もも
+                { a: 25, b: 27, leg: true }, // 左すね
+                { a: 24, b: 26, leg: true }, // 右太もも
+                { a: 26, b: 28, leg: true }, // 右すね
+            ];
+            const BONES = [
+                [11, 12],
+                [11, 23],
+                [12, 24],
+                [23, 24],
+                [11, 13],
+                [13, 15],
+                [12, 14],
+                [14, 16],
+                [23, 25],
+                [25, 27],
+                [24, 26],
+                [26, 28],
+            ];
+
+            // 角度: 0=右, 90=下, 180=左, -90=上（画面座標）
+            const STAND = [97, 93, 83, 87];
+            // 穴の形（足の角度は判定に使わず、腰の高さ／足首の高さで判定する）
+            const SQUAT = [160, 100, 20, 80];
+            const KNEE_L = [120, 60, 83, 87],
+                KNEE_R = [97, 93, 60, 120];
+            const SQUAT_RULE = { squat: true, ignore: [4, 5, 6, 7], hold: 0.5 };
+            const KNEE_L_RULE = {
+                lift: "L",
+                ignore: [4, 5],
+                hold: 0.5,
+                len: [1, 1, 1, 1, 0.35, 1, 1, 1],
+            };
+            const KNEE_R_RULE = {
+                lift: "R",
+                ignore: [6, 7],
+                hold: 0.5,
+                len: [1, 1, 1, 1, 1, 1, 0.35, 1],
+            };
+            const POSES = [
+                {
+                    name: "バンザイ",
+                    a: [-115, -110, -65, -70, ...STAND],
+                    tier: 0,
+                },
+                { name: "T字", a: [180, 180, 0, 0, ...STAND], tier: 0 },
+                {
+                    name: "左手を上げろ",
+                    a: [-95, -92, 82, 86, ...STAND],
+                    tier: 0,
+                },
+                {
+                    name: "右手を上げろ",
+                    a: [98, 94, -85, -88, ...STAND],
+                    tier: 0,
+                },
+                { name: "マッチョ", a: [180, -90, 0, -90, ...STAND], tier: 0 },
+                {
+                    name: "大の字",
+                    a: [-145, -145, -35, -35, 122, 118, 58, 62],
+                    tier: 1,
+                    legW: 1,
+                },
+                { name: "ロボット", a: [180, 90, 0, -90, ...STAND], tier: 1 },
+                {
+                    name: "腰に手",
+                    a: [130, 50, 50, 130, 112, 105, 68, 75],
+                    tier: 1,
+                },
+                {
+                    name: "ディスコ",
+                    a: [145, 145, -40, -40, ...STAND],
+                    tier: 1,
+                },
+                {
+                    name: "頭の上でマル",
+                    a: [-140, -30, -40, -150, ...STAND],
+                    tier: 1,
+                },
+                {
+                    name: "ガニ股マッチョ",
+                    a: [180, -90, 0, -90, 150, 95, 30, 85],
+                    tier: 2,
+                    legW: 1.5,
+                },
+                {
+                    name: "フラミンゴ",
+                    a: [180, 180, 0, 0, 95, 92, 35, 35],
+                    tier: 2,
+                    legW: 1.3,
+                },
+                {
+                    name: "左キック",
+                    a: [180, 180, 0, 0, 145, 145, 85, 88],
+                    tier: 2,
+                    legW: 1.3,
+                },
+                {
+                    name: "ななめ上",
+                    a: [-35, -35, -35, -35, ...STAND],
+                    tier: 2,
+                },
+                { name: "逆ロボット", a: [180, -90, 0, 90, ...STAND], tier: 2 },
+                // ここから上級: 腕と足を同時に、左右で違う形に
+                {
+                    name: "弓を引く",
+                    a: [180, 180, -25, 135, 115, 100, 65, 80],
+                    tier: 3,
+                    legW: 1,
+                },
+                {
+                    name: "木のポーズ",
+                    a: [-140, -30, -40, -150, 95, 92, 25, 160],
+                    tier: 3,
+                    legW: 1.5,
+                },
+                {
+                    name: "片足バンザイ",
+                    a: [-115, -110, -65, -70, 145, 145, 85, 88],
+                    tier: 3,
+                    legW: 1.3,
+                },
+                {
+                    name: "カマキリ",
+                    a: [180, 90, 0, 90, 150, 95, 30, 85],
+                    tier: 3,
+                    legW: 1.5,
+                },
+                {
+                    name: "ななめ一直線",
+                    a: [135, 135, -45, -45, 150, 150, 85, 88],
+                    tier: 3,
+                    legW: 1.3,
+                },
+                {
+                    name: "スーパーヒーロー",
+                    a: [130, 50, -60, -60, 95, 92, 30, 30],
+                    tier: 3,
+                    legW: 1.3,
+                },
+                {
+                    name: "片足マッチョ",
+                    a: [180, -90, 0, -90, 95, 92, 20, 100],
+                    tier: 3,
+                    legW: 1.5,
+                },
+                // しゃがみ（腰を落とす）と片足立ち（ひざを前に上げる）。0.5秒キープしないと通れない
+                {
+                    name: "スクワット",
+                    a: [180, 180, 0, 0, ...SQUAT],
+                    ...SQUAT_RULE,
+                    tier: 1,
+                },
+                {
+                    name: "左ひざ上げ",
+                    a: [180, 180, 0, 0, ...KNEE_L],
+                    ...KNEE_L_RULE,
+                    tier: 2,
+                },
+                {
+                    name: "右ひざ上げ",
+                    a: [180, 180, 0, 0, ...KNEE_R],
+                    ...KNEE_R_RULE,
+                    tier: 2,
+                },
+                {
+                    name: "しゃがんでバンザイ",
+                    a: [-115, -110, -65, -70, ...SQUAT],
+                    ...SQUAT_RULE,
+                    tier: 3,
+                },
+                {
+                    name: "しゃがんでディスコ",
+                    a: [145, 145, -40, -40, ...SQUAT],
+                    ...SQUAT_RULE,
+                    tier: 3,
+                },
+                {
+                    name: "しゃがんで右手を上げろ",
+                    a: [100, 95, -85, -88, ...SQUAT],
+                    ...SQUAT_RULE,
+                    tier: 3,
+                },
+                {
+                    name: "ひざ上げバンザイ",
+                    a: [-115, -110, -65, -70, ...KNEE_R],
+                    ...KNEE_R_RULE,
+                    tier: 3,
+                },
+                {
+                    name: "かかし",
+                    a: [180, 90, 0, 90, ...KNEE_L],
+                    ...KNEE_L_RULE,
+                    tier: 3,
+                },
+                {
+                    name: "片足ディスコ",
+                    a: [145, 145, -40, -40, ...KNEE_L],
+                    ...KNEE_L_RULE,
+                    tier: 3,
+                },
+            ];
+
+            // ---------- 状態 ----------
+            let W = 0,
+                H = 0,
+                DPR = 1;
+            let landmarker = null,
+                lastVideoTime = -1;
+            let state = "title"; // title | menu | howto | ready | playing | over
+            let mode = "solo";
+            let seen = []; // 検出されたすべての人（メニューの手カーソル用）
+            let result = null; // ゲームオーバー画面に出す結果
+            // プレイヤーごとの骨格と一致度。P1 = 画面の左に立つ人、P2 = 右に立つ人
+            const players = [0, 1].map((i) => ({
+                label: `P${i + 1}`,
+                color: PLAYER_COLORS[i],
+                pts: null,
+                live: 0,
+                segs: null,
+                samples: [],
+                raise: 0,
+            }));
+            let banks = []; // ハート・スコア・コンボ（協力/1人は共有で1つ、対戦は1人1つ）
+            let wallsPassed, gameClock, wall, nextWallAt;
+            let overAt = 0;
+            let shake = 0,
+                flash = 0,
+                flashColor = "255,77,109";
+            let popups = [],
+                particles = [];
+            const BEST_KEYS = {
+                solo: "poseWallBest",
+                coop: "poseWallBestCoop",
+            };
+
+            const numPlayers = () => MODES[mode].players;
+            const active = () => players.slice(0, numPlayers());
+            const bankOf = (i) => (mode === "versus" ? banks[i] : banks[0]);
+
+            function loadBest() {
+                try {
+                    return +localStorage.getItem(BEST_KEYS[mode]) || 0;
+                } catch {
+                    return 0;
+                }
+            }
+            function saveBest(v) {
+                try {
+                    localStorage.setItem(BEST_KEYS[mode], v);
+                } catch {}
+            }
+
+            // ---------- 画面サイズ ----------
+            function resize() {
+                DPR = Math.min(window.devicePixelRatio || 1, 2);
+                W = innerWidth;
+                H = innerHeight;
+                for (const c of [cv, wallCv, texCv]) {
+                    c.width = W * DPR;
+                    c.height = H * DPR;
+                }
+                ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+                wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+                tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+                buildWallTexture();
+            }
+            addEventListener("resize", resize);
+
+            function buildWallTexture() {
+                const g = tctx;
+                const grad = g.createLinearGradient(0, 0, 0, H);
+                grad.addColorStop(0, "#b4533a");
+                grad.addColorStop(1, "#7a2f22");
+                g.fillStyle = grad;
+                g.fillRect(0, 0, W, H);
+                const bh = Math.max(22, H / 22),
+                    bw = bh * 2.2;
+                let seed = 7;
+                const rnd = () =>
+                    (seed = (seed * 16807) % 2147483647) / 2147483647;
+                for (let row = 0, y = 0; y < H; row++, y += bh) {
+                    for (let x = ((row % 2) * -bw) / 2; x < W; x += bw) {
+                        const l = 30 + rnd() * 14;
+                        g.fillStyle = `hsl(${10 + rnd() * 8},${45 + rnd() * 15}%,${l}%)`;
+                        g.fillRect(x + 2, y + 2, bw - 4, bh - 4);
+                    }
+                }
+                g.lineWidth = 10;
+                g.strokeStyle = "#3a160f";
+                g.strokeRect(0, 0, W, H);
+            }
+
+            // ---------- 座標変換 ----------
+            function videoRect() {
+                const vw = video.videoWidth || 1280,
+                    vh = video.videoHeight || 720;
+                const s = Math.max(W / vw, H / vh);
+                const dw = vw * s,
+                    dh = vh * s;
+                return { x: (W - dw) / 2, y: (H - dh) / 2, w: dw, h: dh };
+            }
+
+            function toScreen(lms) {
+                const r = videoRect();
+                const pts = lms.map((l) => ({
+                    x: r.x + (1 - l.x) * r.w, // 鏡映し
+                    y: r.y + l.y * r.h,
+                    v:
+                        (l.visibility ?? 1) *
+                        (l.y > 1.02 || l.y < -0.02 || l.x < -0.02 || l.x > 1.02
+                            ? 0
+                            : 1),
+                }));
+                pts.cx = (pts[11].x + pts[12].x + pts[23].x + pts[24].x) / 4;
+                pts.size = Math.hypot(
+                    pts[11].x - pts[12].x,
+                    pts[11].y - pts[12].y,
+                );
+                return pts;
+            }
+
+            // 検出した人をプレイヤーに割り当てる（2人なら画面の左の人がP1）
+            function updateLandmarks(list) {
+                const people = (list || []).map(toScreen);
+                seen = people;
+                const assigned = [null, null];
+                if (numPlayers() === 1) {
+                    if (people.length)
+                        assigned[0] = people.reduce((a, b) =>
+                            b.size > a.size ? b : a,
+                        ); // 一番手前の人
+                } else if (people.length >= 2) {
+                    people.sort((a, b) => a.cx - b.cx);
+                    assigned[0] = people[0];
+                    assigned[1] = people[people.length - 1];
+                } else if (people.length === 1) {
+                    assigned[people[0].cx < W / 2 ? 0 : 1] = people[0];
+                }
+                players.forEach((p, i) => {
+                    const next = assigned[i];
+                    if (next && p.pts) {
+                        for (let k = 0; k < next.length; k++) {
+                            next[k].x = p.pts[k].x * 0.45 + next[k].x * 0.55;
+                            next[k].y = p.pts[k].y * 0.45 + next[k].y * 0.55;
+                        }
+                    }
+                    p.pts = next;
+                });
+            }
+
+            // ---------- ポーズ判定 ----------
+            function scorePose(P, pose) {
+                let sum = 0,
+                    wsum = 0,
+                    worst = 1;
+                const ignore = pose.ignore || [];
+                const segs = SEGS.map((sg, i) => {
+                    if (ignore.includes(i)) return null;
+                    const a = P[sg.a],
+                        b = P[sg.b];
+                    const w = sg.leg ? (pose.legW ?? 0.3) : 1;
+                    let sc = 0;
+                    if (a.v > 0.45 && b.v > 0.45) {
+                        const ang =
+                            (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI;
+                        const d = Math.abs(
+                            ((((ang - pose.a[i]) % 360) + 540) % 360) - 180,
+                        );
+                        sc = Math.min(1, Math.max(0, 1 - (d - 12) / 55)); // 12°以内なら満点、67°以上ずれると0
+                    }
+                    sum += sc * w;
+                    wsum += w;
+                    if (w >= 1) worst = Math.min(worst, sc); // 重要なパーツが1つでも大きくずれたら減点
+                    return sc;
+                });
+                // しゃがみ・片足立ちは角度では測れないので、腰の高さ／足の上がり具合で判定する
+                if (pose.squat || pose.lift) {
+                    const sc = pose.squat
+                        ? squatScore(P)
+                        : liftScore(P, pose.lift);
+                    sum += sc * 1.5;
+                    wsum += 1.5;
+                    worst = Math.min(worst, sc);
+                    ignore.forEach((i) => (segs[i] = sc)); // 足の線の色は深さ／高さの達成度で表示
+                }
+                return { score: (sum / wsum) * (0.5 + 0.5 * worst), segs };
+            }
+
+            // 体の大きさの基準（胴の長さ。前かがみで胴が短く見えるときは肩幅で補う）
+            function bodyUnit(P) {
+                const sx = (P[11].x + P[12].x) / 2,
+                    sy = (P[11].y + P[12].y) / 2;
+                const hx = (P[23].x + P[24].x) / 2,
+                    hy = (P[23].y + P[24].y) / 2;
+                return Math.max(
+                    Math.hypot(sx - hx, sy - hy),
+                    Math.hypot(P[11].x - P[12].x, P[11].y - P[12].y) * 1.25,
+                    1,
+                );
+            }
+            const visible = (P, ...ids) => ids.every((i) => P[i].v > 0.45);
+
+            // 腰から足首までの高さが胴の長さの1.15倍以下なら満点（立っていると約1.7倍）
+            function squatScore(P) {
+                if (!visible(P, 11, 12, 23, 24, 27, 28)) return 0;
+                const r =
+                    (Math.max(P[27].y, P[28].y) - (P[23].y + P[24].y) / 2) /
+                    bodyUnit(P); // 低い方の足で測る（片足を上げてもしゃがみにならない）
+                return Math.min(1, Math.max(0, (1.5 - r) / 0.35));
+            }
+
+            // 上げた足首がもう片方より胴の長さの0.5倍以上高ければ満点
+            function liftScore(P, side) {
+                if (!visible(P, 11, 12, 23, 24, 27, 28)) return 0;
+                const [up, down] = side === "L" ? [27, 28] : [28, 27];
+                const lift = (P[down].y - P[up].y) / bodyUnit(P);
+                return Math.min(1, Math.max(0, (lift - 0.2) / 0.3));
+            }
+
+            function fullBodyVisible(pts) {
+                return (
+                    pts &&
+                    [0, 11, 12, 23, 24, 27, 28].every((i) => pts[i].v > 0.5)
+                );
+            }
+            function handsUp(pts) {
+                return (
+                    pts &&
+                    pts[15].v > 0.5 &&
+                    pts[16].v > 0.5 &&
+                    pts[15].y < pts[0].y &&
+                    pts[16].y < pts[0].y
+                );
+            }
+
+            // ---------- 人型の穴 ----------
+            // L: パーツごとの長さの倍率（ひざを前に上げた太ももは正面から見ると短く見える）
+            function figureJoints(A, cx, cy, h, L = null) {
+                const J = {};
+                const shY = cy - 0.3 * h,
+                    hipY = cy;
+                const len = (i, base) => base * (L ? L[i] : 1);
+                const ext = (p, ang, l) => {
+                    const r = (ang * Math.PI) / 180;
+                    return [
+                        p[0] + Math.cos(r) * l * h,
+                        p[1] + Math.sin(r) * l * h,
+                    ];
+                };
+                J.ls = [cx - 0.12 * h, shY];
+                J.rs = [cx + 0.12 * h, shY];
+                J.lh = [cx - 0.075 * h, hipY];
+                J.rh = [cx + 0.075 * h, hipY];
+                J.head = [cx, shY - 0.14 * h];
+                J.le = ext(J.ls, A[0], len(0, 0.16));
+                J.lw = ext(J.le, A[1], len(1, 0.15));
+                J.re = ext(J.rs, A[2], len(2, 0.16));
+                J.rw = ext(J.re, A[3], len(3, 0.15));
+                J.lk = ext(J.lh, A[4], len(4, 0.24));
+                J.la = ext(J.lk, A[5], len(5, 0.24));
+                J.rk = ext(J.rh, A[6], len(6, 0.24));
+                J.ra = ext(J.rk, A[7], len(7, 0.24));
+                // しゃがんだ形は体ごと下げて、足を床につける
+                const drop = cy + 0.48 * h - Math.max(J.la[1], J.ra[1]);
+                if (drop > 0) for (const k in J) J[k][1] += drop;
+                return J;
+            }
+
+            function traceFigure(g, J, h, pad) {
+                g.lineCap = "round";
+                g.lineJoin = "round";
+                g.lineWidth = 0.1 * h + pad * 2;
+                g.beginPath();
+                for (const chain of [
+                    ["ls", "le", "lw"],
+                    ["rs", "re", "rw"],
+                    ["lh", "lk", "la"],
+                    ["rh", "rk", "ra"],
+                ]) {
+                    g.moveTo(...J[chain[0]]);
+                    g.lineTo(...J[chain[1]]);
+                    g.lineTo(...J[chain[2]]);
+                }
+                g.moveTo(J.head[0], J.head[1]);
+                g.lineTo(J.head[0], J.ls[1]);
+                g.stroke();
+                g.beginPath();
+                g.moveTo(...J.ls);
+                g.lineTo(...J.rs);
+                g.lineTo(...J.rh);
+                g.lineTo(...J.lh);
+                g.closePath();
+                g.fill();
+                g.stroke();
+                g.beginPath();
+                g.arc(J.head[0], J.head[1], 0.085 * h + pad, 0, Math.PI * 2);
+                g.fill();
+            }
+
+            function figureSize(n) {
+                return n === 1
+                    ? Math.min(H * 0.84, W * 0.95)
+                    : Math.min(H * 0.8, W * 0.5);
+            }
+            function slotX(i, n) {
+                return n === 1 ? W / 2 : i === 0 ? W * 0.27 : W * 0.73;
+            }
+            const VP = () => [W / 2, H * 0.45]; // 消失点
+
+            function drawWall(w) {
+                const t = (gameClock - w.t0) / w.dur; // 0→1 で到達
+                let z, alpha;
+                if (t <= 1) {
+                    z = Z_FAR + (1 - Z_FAR) * t;
+                    alpha = 0.55 + 0.4 * (1 - t);
+                } else {
+                    const k = Math.min(1, (gameClock - w.t0 - w.dur) / 0.45);
+                    z = w.anyMiss ? 1 : 1 - 0.45 * k;
+                    alpha = (w.anyMiss ? 0.9 : 0.6) * (1 - k);
+                }
+                const s = 1 / z;
+                const [vx, vy] = VP();
+                const n = w.poses.length,
+                    h = figureSize(n);
+                const g = wctx;
+                g.save();
+                g.setTransform(DPR, 0, 0, DPR, 0, 0);
+                g.clearRect(0, 0, W, H);
+                g.translate(vx, vy);
+                g.scale(s, s);
+                g.translate(-vx, -vy);
+                g.drawImage(texCv, 0, 0, W, H);
+                const figs = w.poses.map((pose, i) =>
+                    figureJoints(pose.a, slotX(i, n), H * 0.52, h, pose.len),
+                );
+                figs.forEach((J, i) => {
+                    g.fillStyle = g.strokeStyle =
+                        players[i].live >= GOOD
+                            ? "#3ddc84"
+                            : n > 1
+                              ? players[i].color
+                              : "#ffcc33";
+                    traceFigure(g, J, h, 7 / s);
+                });
+                g.globalCompositeOperation = "destination-out";
+                g.fillStyle = g.strokeStyle = "#000";
+                figs.forEach((J) => traceFigure(g, J, h, 0));
+                g.restore();
+
+                // 奥行きのガイド線
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, alpha) * 0.5;
+                ctx.strokeStyle = "rgba(255,204,51,.6)";
+                ctx.lineWidth = 2;
+                const x0 = vx + (0 - vx) * s,
+                    x1 = vx + (W - vx) * s,
+                    y0 = vy + (0 - vy) * s,
+                    y1 = vy + (H - vy) * s;
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(x0, y0);
+                ctx.moveTo(W, 0);
+                ctx.lineTo(x1, y0);
+                ctx.moveTo(0, H);
+                ctx.lineTo(x0, y1);
+                ctx.moveTo(W, H);
+                ctx.lineTo(x1, y1);
+                ctx.stroke();
+                ctx.globalAlpha = Math.max(0, alpha);
+                ctx.drawImage(wallCv, 0, 0, W, H);
+                ctx.restore();
+                return t;
+            }
+
+            // ---------- ゲーム進行 ----------
+            function resetGame() {
+                const mk = () => ({
+                    hearts: MODES[mode].hearts,
+                    score: 0,
+                    combo: 0,
+                    bestCombo: 0,
+                    cleared: 0,
+                });
+                banks = mode === "versus" ? [mk(), mk()] : [mk()];
+                wallsPassed = 0;
+                gameClock = 0;
+                wall = null;
+                nextWallAt = 1.2;
+                popups = [];
+                particles = [];
+                players.forEach((p) => {
+                    p.live = 0;
+                    p.samples = [];
+                    p.segs = null;
+                });
+            }
+
+            let lastPoses = [];
+            let forcedPose = null; // デバッグ用
+            function pickPose(exclude = []) {
+                if (forcedPose) return POSES.find((p) => p.name === forcedPose);
+                // 壁を抜けるほど難しいポーズへ。後半は簡単なポーズが出なくなり、上級ポーズが出やすくなる
+                const [minTier, maxTier] =
+                    wallsPassed < 2
+                        ? [0, 0]
+                        : wallsPassed < 4
+                          ? [0, 1]
+                          : wallsPassed < 7
+                            ? [1, 2]
+                            : wallsPassed < 12
+                              ? [1, 3]
+                              : [2, 3];
+                const pool = POSES.filter(
+                    (p) =>
+                        p.tier >= minTier &&
+                        p.tier <= maxTier &&
+                        !lastPoses.includes(p) &&
+                        !exclude.includes(p),
+                ).flatMap((p) =>
+                    p.tier === 3 && wallsPassed >= 7 ? [p, p] : [p],
+                );
+                return pool[Math.floor(Math.random() * pool.length)];
+            }
+
+            function spawnWall() {
+                const dur = Math.max(2.4, 6 - wallsPassed * 0.22);
+                const first = pickPose();
+                // 協力は2人別々のポーズ、対戦は公平に同じポーズ
+                const poses =
+                    numPlayers() === 1
+                        ? [first]
+                        : mode === "versus"
+                          ? [first, first]
+                          : [first, pickPose([first])];
+                lastPoses = [...new Set(poses)];
+                wall = {
+                    poses,
+                    t0: gameClock,
+                    dur,
+                    judged: false,
+                    results: [],
+                    anyMiss: false,
+                    ticks: 0,
+                };
+                players.forEach((p) => {
+                    p.samples = [];
+                    p.live = 0;
+                });
+            }
+
+            function judge() {
+                wall.judged = true;
+                const n = wall.poses.length;
+                const avgs = wall.poses.map((_, i) => {
+                    const recent = players[i].samples.filter(
+                        (s) => s.t > gameClock - (wall.poses[i].hold ?? 0.3),
+                    ); // しゃがみ・片足は長めにキープが必要
+                    return recent.length
+                        ? recent.reduce((a, s) => a + s.v, 0) / recent.length
+                        : 0;
+                });
+                wall.results = avgs.map((a) =>
+                    a >= PERFECT ? "perfect" : a >= GOOD ? "good" : "miss",
+                );
+                wall.anyMiss = wall.results.includes("miss");
+
+                avgs.forEach((avg, i) => {
+                    const b = bankOf(i),
+                        res = wall.results[i],
+                        x = slotX(i, n);
+                    const who = n > 1 ? `${players[i].label} ` : "";
+                    if (res === "miss") {
+                        b.hearts--;
+                        popup(
+                            `${who}MISS…`,
+                            "#ff4d6d",
+                            `一致度 ${Math.round(avg * 100)}%`,
+                            x,
+                        );
+                    } else {
+                        const gained = Math.round(
+                            (res === "perfect" ? 200 : 100) *
+                                (1 + Math.min(b.combo, 9) * 0.1),
+                        );
+                        b.score += gained;
+                        popup(
+                            `${who}${res === "perfect" ? "PERFECT!" : "GOOD!"}`,
+                            res === "perfect" ? "#ffcc33" : "#3ddc84",
+                            `+${gained}  (${Math.round(avg * 100)}%)`,
+                            x,
+                        );
+                        burst(res === "perfect" ? 60 : 30, x);
+                    }
+                });
+                // コンボは「そのハートを使う全員」が通れたときだけ続く
+                banks.forEach((b, bi) => {
+                    const mine = wall.results.filter((_, i) => bankOf(i) === b);
+                    if (mine.every((r) => r !== "miss")) {
+                        b.combo++;
+                        b.cleared++;
+                        b.bestCombo = Math.max(b.bestCombo, b.combo);
+                    } else b.combo = 0;
+                });
+                if (
+                    mode === "coop" &&
+                    wall.results.every((r) => r === "perfect")
+                ) {
+                    banks[0].score += 150;
+                    popup(
+                        "シンクロ!!",
+                        "#ff8ad8",
+                        "+150 ボーナス",
+                        W / 2,
+                        0.25,
+                    );
+                    burst(60, W / 2);
+                }
+
+                if (wall.anyMiss) {
+                    shake = 0.5;
+                    flash = 0.7;
+                    flashColor = "255,77,109";
+                    sfx.hit();
+                } else {
+                    flash = 0.35;
+                    flashColor = "61,220,132";
+                    sfx.pass(wall.results.every((r) => r === "perfect"));
+                }
+                wallsPassed++;
+                nextWallAt =
+                    gameClock + 0.5 + Math.max(0.5, 1.1 - wallsPassed * 0.03);
+            }
+
+            function isOver() {
+                return banks.some((b) => b.hearts <= 0);
+            }
+
+            function popup(text, color, sub, x = W / 2, yk = 0.42) {
+                popups.push({ text, color, sub, x, yk, t: performance.now() });
+            }
+            function burst(n, x = W / 2) {
+                for (let i = 0; i < n; i++) {
+                    const a = Math.random() * Math.PI * 2,
+                        sp = 200 + Math.random() * 500;
+                    particles.push({
+                        x,
+                        y: H * 0.45,
+                        vx: Math.cos(a) * sp,
+                        vy: Math.sin(a) * sp - 200,
+                        life: 1,
+                        c: `hsl(${Math.random() * 360},90%,60%)`,
+                    });
+                }
+            }
+
+            function gameOver() {
+                state = "over";
+                overAt = performance.now();
+                if (mode === "versus") {
+                    const [a, b] = banks;
+                    const winner =
+                        a.hearts > 0 && b.hearts <= 0
+                            ? 0
+                            : b.hearts > 0 && a.hearts <= 0
+                              ? 1
+                              : a.score === b.score
+                                ? -1
+                                : a.score > b.score
+                                  ? 0
+                                  : 1;
+                    result = {
+                        title:
+                            winner < 0
+                                ? "引き分け！"
+                                : `${players[winner].label} の勝ち！`,
+                        color: winner < 0 ? "#ffcc33" : players[winner].color,
+                        big: `P1 ${a.score} 点 − P2 ${b.score} 点`,
+                        info:
+                            `通過した壁 P1 ${a.cleared} 枚 ／ P2 ${b.cleared} 枚` +
+                            (a.hearts <= 0 && b.hearts <= 0
+                                ? "（同時ダウンなのでスコアで判定）"
+                                : ""),
+                    };
+                } else {
+                    const b = banks[0],
+                        best = loadBest(),
+                        newBest = b.score > best;
+                    if (newBest) saveBest(b.score);
+                    result = {
+                        title: "GAME OVER",
+                        color: "#ff4d6d",
+                        big:
+                            mode === "coop"
+                                ? `チーム ${b.score} 点`
+                                : `${b.score} 点`,
+                        info:
+                            `${mode === "coop" ? "2人とも通過した壁" : "通過した壁"} ${b.cleared} 枚 ／ 最大コンボ ${b.bestCombo}` +
+                            (newBest
+                                ? " ／ ベスト更新！"
+                                : ` ／ ベスト ${best} 点`),
+                    };
+                }
+                sfx.over();
+            }
+
+            function startGame() {
+                resetGame();
+                state = "playing";
+                sfx.start();
+            }
+
+            function toMenu() {
+                state = "menu";
+                wall = null;
+            }
+
+            function goReady(m) {
+                mode = m;
+                state = "ready";
+                players.forEach((p) => {
+                    p.raise = 0;
+                    p.pts = null;
+                });
+            }
+
+            // ---------- 体で操作するボタン ----------
+            // ボタンに手（手首の少し先）をかざし続けると選択される
+            const DWELL = 1.1;
+            let buttons = [],
+                lastButtons = [],
+                hoverProg = {},
+                uiCooldown = 0;
+
+            function handCursors() {
+                const out = [];
+                for (const P of seen)
+                    for (const [w, e] of [
+                        [15, 13],
+                        [16, 14],
+                    ]) {
+                        if (P[w].v < 0.5) continue;
+                        const k = P[e].v > 0.5 ? 0.35 : 0;
+                        out.push({
+                            x: P[w].x + (P[w].x - P[e].x) * k,
+                            y: P[w].y + (P[w].y - P[e].y) * k,
+                        });
+                    }
+                return out;
+            }
+
+            function button(id, label, cx, cy, onSelect, opts = {}) {
+                const w = opts.w ?? Math.min(W * 0.27, 360),
+                    h = opts.h ?? Math.max(64, H * 0.13);
+                buttons.push({
+                    id,
+                    label,
+                    sub: opts.sub,
+                    color: opts.color ?? "#ffcc33",
+                    x: cx - w / 2,
+                    y: cy - h / 2,
+                    w,
+                    h,
+                    onSelect,
+                });
+            }
+
+            function selectButton(b) {
+                hoverProg = {};
+                uiCooldown = 0.8;
+                sfx.select();
+                b.onSelect();
+            }
+
+            function updateButtons(dt) {
+                const u = Math.min(W, H) / 100,
+                    cursors = handCursors();
+                uiCooldown = Math.max(0, uiCooldown - dt);
+                let fired = null;
+                for (const b of buttons) {
+                    const over =
+                        uiCooldown <= 0 &&
+                        cursors.some(
+                            (c) =>
+                                c.x >= b.x &&
+                                c.x <= b.x + b.w &&
+                                c.y >= b.y &&
+                                c.y <= b.y + b.h,
+                        );
+                    const prev = hoverProg[b.id] || 0;
+                    if (over && prev === 0) sfx.hover();
+                    const k = over
+                        ? prev + dt / DWELL
+                        : Math.max(0, prev - dt * 2);
+                    hoverProg[b.id] = k;
+                    drawButton(b, Math.min(1, k), over, u);
+                    if (k >= 1 && !fired) fired = b;
+                }
+                for (const c of cursors) drawCursor(c, u);
+                lastButtons = buttons;
+                buttons = [];
+                if (fired) selectButton(fired);
+            }
+
+            function roundRect(x, y, w, h, r) {
+                ctx.beginPath();
+                ctx.moveTo(x + r, y);
+                ctx.arcTo(x + w, y, x + w, y + h, r);
+                ctx.arcTo(x + w, y + h, x, y + h, r);
+                ctx.arcTo(x, y + h, x, y, r);
+                ctx.arcTo(x, y, x + w, y, r);
+                ctx.closePath();
+            }
+
+            function drawButton(b, k, over, u) {
+                const r = Math.min(24, b.h / 3);
+                ctx.save();
+                roundRect(b.x, b.y, b.w, b.h, r);
+                ctx.fillStyle = "rgba(12,14,30,.78)";
+                ctx.fill();
+                if (k > 0) {
+                    // かざしている間たまっていくゲージ
+                    ctx.save();
+                    ctx.clip();
+                    ctx.fillStyle = b.color;
+                    ctx.globalAlpha = 0.45;
+                    ctx.fillRect(b.x, b.y, b.w * k, b.h);
+                    ctx.restore();
+                }
+                roundRect(b.x, b.y, b.w, b.h, r);
+                ctx.lineWidth = over ? 6 : 3;
+                ctx.strokeStyle = b.color;
+                if (over) {
+                    ctx.shadowColor = b.color;
+                    ctx.shadowBlur = 20;
+                }
+                ctx.stroke();
+                ctx.restore();
+                const cy = b.y + b.h / 2;
+                text(
+                    b.label,
+                    b.x + b.w / 2,
+                    b.sub ? cy - b.h * 0.13 : cy,
+                    Math.min(u * 4.6, b.h * 0.34),
+                    "#fff",
+                );
+                if (b.sub)
+                    text(
+                        b.sub,
+                        b.x + b.w / 2,
+                        cy + b.h * 0.24,
+                        Math.min(u * 2.4, b.h * 0.18),
+                        "rgba(255,255,255,.75)",
+                        "center",
+                        600,
+                    );
+            }
+
+            function drawCursor(c, u) {
+                const r = Math.max(12, u * 2.2);
+                ctx.save();
+                ctx.fillStyle = "rgba(255,255,255,.25)";
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+                ctx.fillStyle = "#fff";
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, r * 0.3, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            function drawPanel(x, y, w, h) {
+                ctx.save();
+                roundRect(x, y, w, h, 20);
+                ctx.fillStyle = "rgba(8,10,24,.82)";
+                ctx.fill();
+                ctx.strokeStyle = "rgba(255,255,255,.15)";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // ---------- 効果音 ----------
+            let actx = null;
+            function tone(
+                freq,
+                dur,
+                type = "square",
+                vol = 0.12,
+                delay = 0,
+                slide = 0,
+            ) {
+                if (!actx) return;
+                const t = actx.currentTime + delay;
+                const o = actx.createOscillator(),
+                    gn = actx.createGain();
+                o.type = type;
+                o.frequency.setValueAtTime(freq, t);
+                if (slide)
+                    o.frequency.exponentialRampToValueAtTime(slide, t + dur);
+                gn.gain.setValueAtTime(vol, t);
+                gn.gain.exponentialRampToValueAtTime(0.001, t + dur);
+                o.connect(gn).connect(actx.destination);
+                o.start(t);
+                o.stop(t + dur + 0.02);
+            }
+            const sfx = {
+                tick: () => tone(880, 0.07, "square", 0.06),
+                pass: (p) =>
+                    [523, 659, 784, p ? 1047 : 0].forEach(
+                        (f, i) =>
+                            f && tone(f, 0.15, "triangle", 0.15, i * 0.07),
+                    ),
+                hit: () => {
+                    tone(160, 0.5, "sawtooth", 0.25, 0, 40);
+                    tone(90, 0.6, "square", 0.2, 0.02, 30);
+                },
+                start: () =>
+                    [392, 523, 659].forEach((f, i) =>
+                        tone(f, 0.12, "triangle", 0.15, i * 0.09),
+                    ),
+                over: () =>
+                    [392, 330, 262, 196].forEach((f, i) =>
+                        tone(f, 0.25, "triangle", 0.18, i * 0.18),
+                    ),
+                hover: () => tone(660, 0.06, "sine", 0.06),
+                select: () =>
+                    [784, 1175].forEach((f, i) =>
+                        tone(f, 0.1, "triangle", 0.14, i * 0.06),
+                    ),
+            };
+
+            // ---------- 描画ヘルパー ----------
+            function drawVideo() {
+                const r = videoRect();
+                ctx.save();
+                ctx.translate(W, 0);
+                ctx.scale(-1, 1);
+                ctx.drawImage(video, W - r.x - r.w, r.y, r.w, r.h);
+                ctx.restore();
+                ctx.fillStyle = "rgba(10,12,30,.25)";
+                ctx.fillRect(0, 0, W, H);
+            }
+
+            function drawDivider() {
+                if (numPlayers() < 2) return;
+                ctx.save();
+                ctx.setLineDash([14, 12]);
+                ctx.strokeStyle = "rgba(255,255,255,.35)";
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(W / 2, 0);
+                ctx.lineTo(W / 2, H);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            function drawSkeleton(p, segScores) {
+                const pts = p.pts;
+                if (!pts) return;
+                ctx.save();
+                ctx.lineCap = "round";
+                const colorFor = (i, j) => {
+                    if (!segScores) return p.color;
+                    const k = SEGS.findIndex((s) => s.a === i && s.b === j);
+                    if (k < 0) return "rgba(255,255,255,.85)";
+                    const sc = segScores[k];
+                    return sc >= 0.7
+                        ? "#3ddc84"
+                        : sc >= 0.35
+                          ? "#ffcc33"
+                          : "#ff4d6d";
+                };
+                for (const [i, j] of BONES) {
+                    if (pts[i].v < 0.4 || pts[j].v < 0.4) continue;
+                    const c = colorFor(i, j);
+                    ctx.strokeStyle = "rgba(0,0,0,.55)";
+                    ctx.lineWidth = 14;
+                    ctx.beginPath();
+                    ctx.moveTo(pts[i].x, pts[i].y);
+                    ctx.lineTo(pts[j].x, pts[j].y);
+                    ctx.stroke();
+                    ctx.strokeStyle = c;
+                    ctx.lineWidth = 8;
+                    ctx.shadowColor = c;
+                    ctx.shadowBlur = 14;
+                    ctx.beginPath();
+                    ctx.moveTo(pts[i].x, pts[i].y);
+                    ctx.lineTo(pts[j].x, pts[j].y);
+                    ctx.stroke();
+                    ctx.shadowBlur = 0;
+                }
+                if (pts[0].v > 0.4) {
+                    const r = Math.max(14, pts.size * 0.32);
+                    ctx.strokeStyle = numPlayers() > 1 ? p.color : "#fff";
+                    ctx.lineWidth = 5;
+                    ctx.beginPath();
+                    ctx.arc(pts[0].x, pts[0].y, r, 0, Math.PI * 2);
+                    ctx.stroke();
+                    if (numPlayers() > 1)
+                        text(p.label, pts[0].x, pts[0].y - r - 18, 26, p.color);
+                }
+                ctx.restore();
+            }
+
+            function drawMiniFigure(pose, cx, cy, h, color = "#ffcc33") {
+                const J = figureJoints(pose.a, cx, cy, h, pose.len);
+                ctx.save();
+                ctx.fillStyle = ctx.strokeStyle = color;
+                traceFigure(ctx, J, h, 0);
+                ctx.restore();
+            }
+
+            function text(
+                str,
+                x,
+                y,
+                size,
+                color = "#fff",
+                align = "center",
+                weight = 800,
+            ) {
+                ctx.font = `${weight} ${size}px "Hiragino Kaku Gothic ProN","Yu Gothic UI","Meiryo",sans-serif`;
+                ctx.textAlign = align;
+                ctx.textBaseline = "middle";
+                ctx.lineWidth = Math.max(3, size / 8);
+                ctx.strokeStyle = "rgba(0,0,0,.75)";
+                ctx.lineJoin = "round";
+                ctx.strokeText(str, x, y);
+                ctx.fillStyle = color;
+                ctx.fillText(str, x, y);
+            }
+
+            function drawHearts(b, x, y, size, align) {
+                const max = MODES[mode].hearts,
+                    step = size * 1.05;
+                for (let i = 0; i < max; i++) {
+                    const hx =
+                        align === "left"
+                            ? x + size / 2 + i * step
+                            : x - size / 2 - (max - 1 - i) * step;
+                    text(
+                        i < b.hearts ? "♥" : "♡",
+                        hx,
+                        y,
+                        size,
+                        i < b.hearts ? "#ff4d6d" : "rgba(255,255,255,.4)",
+                    );
+                }
+            }
+
+            function drawMeter(p, cx, bw, u) {
+                const bh = Math.max(14, u * 2.4),
+                    bx = cx - bw / 2,
+                    by = H - bh - 24;
+                ctx.fillStyle = "rgba(0,0,0,.55)";
+                ctx.fillRect(bx - 4, by - 4, bw + 8, bh + 8);
+                ctx.fillStyle =
+                    p.live >= PERFECT
+                        ? "#ffcc33"
+                        : p.live >= GOOD
+                          ? "#3ddc84"
+                          : "#ff4d6d";
+                ctx.fillRect(bx, by, bw * p.live, bh);
+                for (const th of [GOOD, PERFECT]) {
+                    ctx.fillStyle = "#fff";
+                    ctx.fillRect(bx + bw * th - 1.5, by - 6, 3, bh + 12);
+                }
+                const who = numPlayers() > 1 ? `${p.label} ` : "";
+                text(
+                    `${who}一致度 ${Math.round(p.live * 100)}%`,
+                    cx,
+                    by - u * 2.5,
+                    u * 3,
+                    numPlayers() > 1 ? p.color : "#fff",
+                );
+            }
+
+            function drawHUD() {
+                const u = Math.min(W, H) / 100,
+                    n = numPlayers(),
+                    top = 16 + u * 3.5;
+                if (mode === "versus") {
+                    banks.forEach((b, i) => {
+                        const left = i === 0,
+                            x = left ? 16 : W - 16,
+                            al = left ? "left" : "right";
+                        text(
+                            players[i].label,
+                            x,
+                            top,
+                            u * 4.5,
+                            players[i].color,
+                            al,
+                        );
+                        drawHearts(
+                            b,
+                            left ? x + u * 8 : x - u * 8,
+                            top,
+                            u * 5.5,
+                            al,
+                        );
+                        text(
+                            `${b.score}`,
+                            x,
+                            top + u * 6.5,
+                            u * 4.5,
+                            "#fff",
+                            al,
+                        );
+                        if (b.combo > 1)
+                            text(
+                                `${b.combo} COMBO`,
+                                x,
+                                top + u * 11,
+                                u * 3,
+                                "#ffcc33",
+                                al,
+                            );
+                    });
+                } else {
+                    const b = banks[0];
+                    drawHearts(b, 16, top, u * 6.5, "left");
+                    text(`${b.score}`, W - 20, top, u * 6, "#fff", "right");
+                    if (b.combo > 1)
+                        text(
+                            `${b.combo} COMBO`,
+                            W - 20,
+                            top + u * 6,
+                            u * 3.5,
+                            "#ffcc33",
+                            "right",
+                        );
+                }
+                text(
+                    `WALL ${wallsPassed + 1}`,
+                    W / 2,
+                    16 + u * 3,
+                    u * 3,
+                    "rgba(255,255,255,.8)",
+                );
+
+                if (wall && !wall.judged) {
+                    const t = (gameClock - wall.t0) / wall.dur;
+                    // ポーズ名とお手本
+                    if (n === 1 || mode === "versus") {
+                        text(
+                            wall.poses[0].name,
+                            W / 2,
+                            16 + u * 9,
+                            u * 7,
+                            "#ffcc33",
+                        );
+                    } else {
+                        wall.poses.forEach((pose, i) =>
+                            text(
+                                pose.name,
+                                slotX(i, n),
+                                16 + u * 10,
+                                u * 5,
+                                players[i].color,
+                            ),
+                        );
+                    }
+                    if (n === 1)
+                        drawMiniFigure(
+                            wall.poses[0],
+                            W - u * 9,
+                            H - u * 14,
+                            u * 18,
+                        );
+                    else
+                        wall.poses.forEach((pose, i) =>
+                            drawMiniFigure(
+                                pose,
+                                i === 0 ? u * 8 : W - u * 8,
+                                H - u * 22,
+                                u * 15,
+                                mode === "coop" ? players[i].color : "#ffcc33",
+                            ),
+                        );
+                    // 一致度メーター
+                    if (n === 1)
+                        drawMeter(players[0], W / 2, Math.min(W * 0.5, 460), u);
+                    else
+                        players.forEach((p, i) =>
+                            drawMeter(
+                                p,
+                                slotX(i, n),
+                                Math.min(W * 0.3, 320),
+                                u,
+                            ),
+                        );
+                    // 迫ってくる警告
+                    if (t > 0.7 && Math.sin(performance.now() / 60) > 0)
+                        text(
+                            "!! 壁が来る !!",
+                            W / 2,
+                            H * 0.2,
+                            u * 4.5,
+                            "#ff4d6d",
+                        );
+                }
+                drawPresenceWarnings(u);
+            }
+
+            function drawPresenceWarnings(u, y = H * 0.3) {
+                const n = numPlayers();
+                active().forEach((p, i) => {
+                    if (fullBodyVisible(p.pts)) return;
+                    const who = n > 1 ? `${p.label}: ` : "";
+                    const msg = p.pts
+                        ? `${who}足まで全身が映るように下がってね`
+                        : n > 1
+                          ? `${p.label} が見えません`
+                          : "カメラに映ってください";
+                    text(
+                        msg,
+                        slotX(i, n),
+                        y,
+                        u * (n > 1 ? 3 : 4),
+                        n > 1 ? p.color : "#7fdcff",
+                    );
+                });
+            }
+
+            function drawPopups(now) {
+                const u = Math.min(W, H) / 100,
+                    big = numPlayers() > 1 ? 7.5 : 11;
+                popups = popups.filter((p) => now - p.t < 1100);
+                for (const p of popups) {
+                    const k = (now - p.t) / 1100;
+                    ctx.save();
+                    ctx.globalAlpha = 1 - k * k;
+                    const sc = 1 + 0.4 * Math.max(0, 1 - k * 6);
+                    text(p.text, p.x, H * p.yk - k * 40, u * big * sc, p.color);
+                    if (p.sub)
+                        text(
+                            p.sub,
+                            p.x,
+                            H * p.yk + u * big * 0.8 - k * 40,
+                            u * 3.5,
+                            "#fff",
+                        );
+                    ctx.restore();
+                }
+            }
+
+            function drawParticles(dt) {
+                particles = particles.filter((p) => (p.life -= dt * 0.9) > 0);
+                for (const p of particles) {
+                    p.vy += 900 * dt;
+                    p.x += p.vx * dt;
+                    p.y += p.vy * dt;
+                    ctx.globalAlpha = p.life;
+                    ctx.fillStyle = p.c;
+                    ctx.fillRect(p.x - 5, p.y - 5, 10, 10);
+                }
+                ctx.globalAlpha = 1;
+            }
+
+            function drawRing(cx, cy, r, k, color) {
+                ctx.save();
+                ctx.lineWidth = 10;
+                ctx.lineCap = "round";
+                ctx.strokeStyle = "rgba(255,255,255,.2)";
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.strokeStyle = color;
+                ctx.beginPath();
+                ctx.arc(
+                    cx,
+                    cy,
+                    r,
+                    -Math.PI / 2,
+                    -Math.PI / 2 + Math.PI * 2 * k,
+                );
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // ---------- 画面ごとの処理 ----------
+            function updatePlaying(dt, now) {
+                const ps = active();
+                if (ps.every((p) => p.pts)) gameClock += dt; // 全員が映っていない間は一時停止
+                if (!wall && gameClock >= nextWallAt) spawnWall();
+                if (wall) {
+                    ps.forEach((p, i) => {
+                        p.segs = null;
+                        if (wall.judged || !p.pts) return;
+                        const r = scorePose(p.pts, wall.poses[i]);
+                        p.live = p.live * 0.6 + r.score * 0.4;
+                        p.segs = r.segs;
+                        p.samples.push({ t: gameClock, v: r.score });
+                    });
+                    const t = drawWall(wall);
+                    // 残り3秒からカウント音
+                    const remain = (1 - t) * wall.dur;
+                    if (
+                        !wall.judged &&
+                        remain < 3 - wall.ticks &&
+                        wall.ticks < 3
+                    ) {
+                        wall.ticks++;
+                        sfx.tick();
+                    }
+                    if (!wall.judged && t >= 1) judge();
+                    if (wall.judged && gameClock - wall.t0 - wall.dur > 0.45) {
+                        wall = null;
+                        if (isOver()) gameOver();
+                    }
+                }
+                drawDivider();
+                ps.forEach((p) =>
+                    drawSkeleton(p, wall && !wall.judged ? p.segs : null),
+                );
+                drawParticles(dt);
+                drawHUD();
+                drawPopups(now);
+            }
+
+            // 左右の端にボタンを置く（体の正面だと手を伸ばしにくく、下ろした手でも誤選択しにくい）
+            const COL_L = () => W * 0.17,
+                COL_R = () => W * 0.83;
+            const drawSeen = () =>
+                seen.forEach((P) =>
+                    drawSkeleton({ pts: P, color: "#7fdcff", label: "" }, null),
+                );
+
+            function updateMenu(dt) {
+                const u = Math.min(W, H) / 100;
+                drawSeen();
+                text("ポーズウォール", W / 2, H * 0.11, u * 9, "#ffcc33");
+                text(
+                    seen.length
+                        ? "ボタンに手をかざして選んでね ✋"
+                        : "カメラの前に立ってね",
+                    W / 2,
+                    H * 0.21,
+                    u * 3.6,
+                    "#fff",
+                );
+                const best = (m) => {
+                    try {
+                        return +localStorage.getItem(BEST_KEYS[m]) || 0;
+                    } catch {
+                        return 0;
+                    }
+                };
+                button(
+                    "solo",
+                    "1人プレイ",
+                    COL_L(),
+                    H * 0.4,
+                    () => goReady("solo"),
+                    { sub: `ベスト ${best("solo")} 点` },
+                );
+                button(
+                    "coop",
+                    "2人で協力",
+                    COL_L(),
+                    H * 0.64,
+                    () => goReady("coop"),
+                    { color: "#7fdcff", sub: "別々の穴・ハート共有" },
+                );
+                button(
+                    "versus",
+                    "2人で対戦",
+                    COL_R(),
+                    H * 0.4,
+                    () => goReady("versus"),
+                    { color: "#ff8ad8", sub: "同じ穴で勝負" },
+                );
+                button(
+                    "howto",
+                    "あそびかた",
+                    COL_R(),
+                    H * 0.64,
+                    () => {
+                        state = "howto";
+                    },
+                    { color: "#3ddc84" },
+                );
+                text(
+                    "キーボード: 1 / 2 / 3 でも選べます",
+                    W / 2,
+                    H - 24,
+                    u * 2.2,
+                    "rgba(255,255,255,.6)",
+                    "center",
+                    600,
+                );
+                updateButtons(dt);
+            }
+
+            function updateHowto(dt) {
+                const u = Math.min(W, H) / 100;
+                drawSeen();
+                const lines = [
+                    ["🧱 壁の穴と同じポーズをして通り抜けよう", "#fff"],
+                    [
+                        "手足の角度で判定。立つ位置や体の大きさは関係なし",
+                        "#fff",
+                    ],
+                    ["しゃがみ・片足立ちのポーズは 0.5秒キープ！", "#ffcc33"],
+                    [
+                        "ポーズが合っていないとハートが減る。なくなったら終わり",
+                        "#fff",
+                    ],
+                    [
+                        "骨格の線: 緑 = OK ／ 黄 = おしい ／ 赤 = ずれてる",
+                        "#3ddc84",
+                    ],
+                    [
+                        "協力: 2人別々の穴。ハート5つを共有。2人ともPERFECTでシンクロボーナス",
+                        "#7fdcff",
+                    ],
+                    [
+                        "対戦: 同じ穴で勝負。先にハートがなくなった方の負け",
+                        "#ff8ad8",
+                    ],
+                    ["2人のときは 左に立つ人がP1、右がP2", "#fff"],
+                ];
+                const pw = Math.min(W * 0.62, 900),
+                    lh = Math.max(u * 5, 26),
+                    ph = lh * (lines.length + 2.2);
+                const px = W / 2 - pw / 2,
+                    py = H * 0.47 - ph / 2;
+                drawPanel(px, py, pw, ph);
+                text("あそびかた", W / 2, py + lh * 0.9, u * 5, "#ffcc33");
+                const fs = Math.min(u * 2.8, pw / 34);
+                lines.forEach(([s, c], i) =>
+                    text(s, W / 2, py + lh * (2.1 + i), fs, c, "center", 700),
+                );
+                button("back", "もどる", COL_R(), H * 0.86, toMenu, {
+                    h: Math.max(56, H * 0.11),
+                    w: Math.min(W * 0.22, 280),
+                });
+                updateButtons(dt);
+            }
+
+            function updateReady(dt) {
+                const u = Math.min(W, H) / 100,
+                    n = numPlayers(),
+                    ps = active();
+                drawDivider();
+                ps.forEach((p) => drawSkeleton(p, null));
+                text(MODES[mode].label, W / 2, H * 0.12, u * 7, "#ffcc33");
+                const allOk = ps.every((p) => fullBodyVisible(p.pts));
+                if (allOk)
+                    text(
+                        n > 1
+                            ? "2人とも OK！ 両手を頭の上に上げるとスタート"
+                            : "全身OK！ 両手を頭の上に上げるとスタート",
+                        W / 2,
+                        H * 0.23,
+                        u * 3.6,
+                        "#3ddc84",
+                    );
+                else if (n > 1)
+                    text(
+                        "左にP1、右にP2が立って、2人とも全身が映るようにしてね",
+                        W / 2,
+                        H * 0.23,
+                        u * 3,
+                        "#7fdcff",
+                    );
+                if (!allOk) drawPresenceWarnings(u, H * 0.4);
+                text(
+                    "（スペースキーでもスタート）",
+                    W / 2,
+                    H * 0.3,
+                    u * 2.6,
+                    "rgba(255,255,255,.75)",
+                    "center",
+                    600,
+                );
+                ps.forEach((p, i) => {
+                    p.raise = handsUp(p.pts)
+                        ? p.raise + dt
+                        : Math.max(0, p.raise - dt * 2);
+                    if (p.raise > 0)
+                        drawRing(
+                            n > 1 ? slotX(i, n) : W / 2,
+                            H * 0.52,
+                            u * 7,
+                            Math.min(1, p.raise),
+                            n > 1 ? p.color : "#3ddc84",
+                        );
+                });
+                button("menu", "メニューへ", W * 0.12, H * 0.88, toMenu, {
+                    h: Math.max(52, H * 0.1),
+                    w: Math.min(W * 0.2, 240),
+                    color: "#aab",
+                });
+                updateButtons(dt);
+                if (state === "ready" && ps.every((p) => p.raise >= 1))
+                    startGame();
+            }
+
+            function updateOver(dt, now) {
+                const u = Math.min(W, H) / 100;
+                ctx.fillStyle = "rgba(5,6,15,.6)";
+                ctx.fillRect(0, 0, W, H);
+                drawSeen();
+                const pw = Math.min(W * 0.56, 760),
+                    ph = H * 0.42,
+                    px = W / 2 - pw / 2,
+                    py = H * 0.08;
+                drawPanel(px, py, pw, ph);
+                text(
+                    result.title,
+                    W / 2,
+                    py + ph * 0.24,
+                    Math.min(u * 10, pw / 7),
+                    result.color,
+                );
+                text(
+                    result.big,
+                    W / 2,
+                    py + ph * 0.56,
+                    Math.min(u * 6, pw / 12),
+                    "#fff",
+                );
+                text(
+                    result.info,
+                    W / 2,
+                    py + ph * 0.82,
+                    Math.min(u * 2.6, pw / 30),
+                    "rgba(255,255,255,.85)",
+                    "center",
+                    600,
+                );
+                if (now - overAt > 1200) {
+                    // 終わった直後の誤選択を防ぐ
+                    button("retry", "もう一度", COL_L(), H * 0.7, startGame);
+                    button("menu", "メニューへ", COL_R(), H * 0.7, toMenu, {
+                        color: "#aab",
+                    });
+                }
+                updateButtons(dt);
+            }
+
+            // ---------- メインループ ----------
+            let lastFrame = performance.now();
+            function frame() {
+                const now = performance.now();
+                const dt = Math.min(0.05, (now - lastFrame) / 1000);
+                lastFrame = now;
+
+                if (
+                    landmarker &&
+                    video.readyState >= 2 &&
+                    video.currentTime !== lastVideoTime
+                ) {
+                    lastVideoTime = video.currentTime;
+                    const res = landmarker.detectForVideo(video, now);
+                    updateLandmarks(res.landmarks);
+                }
+
+                ctx.save();
+                if (shake > 0) {
+                    shake -= dt;
+                    const m = 22 * shake;
+                    ctx.translate(
+                        (Math.random() - 0.5) * m,
+                        (Math.random() - 0.5) * m,
+                    );
+                }
+                ctx.fillStyle = "#0b0d17";
+                ctx.fillRect(-30, -30, W + 60, H + 60);
+                if (video.readyState >= 2) drawVideo();
+
+                if (state === "playing") updatePlaying(dt, now);
+                else if (state === "menu") updateMenu(dt);
+                else if (state === "howto") updateHowto(dt);
+                else if (state === "ready") updateReady(dt);
+                else if (state === "over") updateOver(dt, now);
+
+                if (flash > 0) {
+                    flash -= dt * 1.6;
+                    ctx.fillStyle = `rgba(${flashColor},${Math.max(0, flash) * 0.5})`;
+                    ctx.fillRect(-30, -30, W + 60, H + 60);
+                }
+                ctx.restore();
+            }
+            function loop() {
+                frame();
+                requestAnimationFrame(loop);
+            }
+
+            // ---------- 起動 ----------
+            const landmarkerOptions = (delegate) => ({
+                baseOptions: { modelAssetPath: MODEL_URL, delegate },
+                runningMode: "VIDEO",
+                numPoses: 2,
+                minPoseDetectionConfidence: 0.5,
+                minPosePresenceConfidence: 0.5,
+                minTrackingConfidence: 0.5,
+            });
+
+            async function init() {
+                const btn = $("startBtn"),
+                    status = $("status");
+                btn.disabled = true;
+                try {
+                    actx = new (
+                        window.AudioContext || window.webkitAudioContext
+                    )();
+                    status.textContent = "カメラを起動中…";
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            width: { ideal: 1280 },
+                            height: { ideal: 720 },
+                            facingMode: "user",
+                        },
+                        audio: false,
+                    });
+                    video.srcObject = stream;
+                    await video.play();
+                    status.textContent =
+                        "骨格認識モデルを読み込み中…（初回は少し時間がかかります）";
+                    const fileset =
+                        await FilesetResolver.forVisionTasks(WASM_URL);
+                    try {
+                        landmarker = await PoseLandmarker.createFromOptions(
+                            fileset,
+                            landmarkerOptions("GPU"),
+                        );
+                    } catch {
+                        landmarker = await PoseLandmarker.createFromOptions(
+                            fileset,
+                            landmarkerOptions("CPU"),
+                        );
+                    }
+                    $("title").classList.add("hidden");
+                    toMenu();
+                } catch (e) {
+                    console.error(e);
+                    status.textContent =
+                        e.name === "NotAllowedError"
+                            ? "カメラの使用が許可されませんでした。ブラウザの設定で許可してください。"
+                            : `起動できませんでした: ${e.message || e}`;
+                    btn.disabled = false;
+                }
+            }
+
+            $("startBtn").addEventListener("click", init);
+            // マウスでもボタンを押せるようにしておく（体で選べないときの予備）
+            cv.addEventListener("click", (e) => {
+                const b = lastButtons.find(
+                    (b) =>
+                        e.clientX >= b.x &&
+                        e.clientX <= b.x + b.w &&
+                        e.clientY >= b.y &&
+                        e.clientY <= b.y + b.h,
+                );
+                if (b) selectButton(b);
+            });
+            addEventListener("keydown", (e) => {
+                if (e.code === "Space") {
+                    e.preventDefault();
+                    if (
+                        state === "ready" ||
+                        (state === "over" && performance.now() - overAt > 800)
+                    )
+                        startGame();
+                }
+                if (e.code === "Escape" && state !== "title") toMenu();
+                if (state === "menu") {
+                    const m = {
+                        Digit1: "solo",
+                        Digit2: "coop",
+                        Digit3: "versus",
+                        Numpad1: "solo",
+                        Numpad2: "coop",
+                        Numpad3: "versus",
+                    }[e.code];
+                    if (m) goReady(m);
+                }
+            });
+
+            // ?debug を付けて開くと、カメラなしで動作確認するためのフックを公開する
+            if (new URLSearchParams(location.search).has("debug")) {
+                window.__pw = {
+                    feed: (list) => {
+                        players.forEach((p) => (p.pts = null));
+                        updateLandmarks(list);
+                    },
+                    menu: () => {
+                        $("title").classList.add("hidden");
+                        toMenu();
+                    },
+                    ready: (m) => {
+                        $("title").classList.add("hidden");
+                        goReady(m);
+                    },
+                    start: startGame,
+                    buttons: () =>
+                        lastButtons.map((b) => ({
+                            id: b.id,
+                            x: b.x + b.w / 2,
+                            y: b.y + b.h / 2,
+                        })),
+                    force: (name) => {
+                        forcedPose = name;
+                    },
+                    frame,
+                    poseOf: (a, len) => figureJoints(a, 0.5, 0.5, 0.8, len),
+                    info: () => ({
+                        state,
+                        mode,
+                        wallsPassed,
+                        banks,
+                        live: players.map((p) => p.live),
+                        poses: wall?.poses,
+                        names: wall?.poses.map((p) => p.name),
+                        t: wall && (gameClock - wall.t0) / wall.dur,
+                    }),
+                    loadModel: async () => {
+                        const fileset =
+                            await FilesetResolver.forVisionTasks(WASM_URL);
+                        landmarker = await PoseLandmarker.createFromOptions(
+                            fileset,
+                            landmarkerOptions("CPU"),
+                        );
+                        return "ok";
+                    },
+                };
+            }
+
+            resize();
+            requestAnimationFrame(loop);
+        </script>
+    </body>
+</html>

@@ -1,0 +1,37 @@
+{
+  "name": "posewall",
+  "version": "1.0.0",
+  "description": "カメラで全身のポーズを読み取って壁の穴を通り抜けるゲーム",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "web": "node server.js",
+    "dist": "electron-builder --win portable",
+    "build:web": "node scripts/build-web.js",
+    "preview:web": "npm run build:web && wrangler pages dev",
+    "deploy:web": "npm run build:web && wrangler pages deploy"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "0.10.14"
+  },
+  "build": {
+    "appId": "com.posewall.game",
+    "productName": "PoseWall",
+    "files": [
+      "index.html",
+      "main.js",
+      "preload.js",
+      "models/**/*"
+    ],
+    "win": {
+      "target": "portable"
+    },
+    "directories": {
+      "output": "dist"
+    }
+  },
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "^26.15.3"
+  }
+}
